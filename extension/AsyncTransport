@@ -1,0 +1,112 @@
+package elasticsearchinstrumentation
+import (
+"context"
+"log"
+"regexp"
+"strings"
+"time"
+elasticsearch "github.com/elastic/go-elasticsearch/v8"
+"go.opentelemetry.io/otel"
+"go.opentelemetry.io/otel/trace"
+)
+// Config holds instrumentation configurations.
+type Config struct {
+SpanNamePrefix string
+RequestHook    func(ctx context.Context, span trace.Span, method, url string, body interface{})
+ResponseHook   func(ctx context.Context, span trace.Span, response interface{})
+}
+// Default values for the instrumentation.
+const (
+defaultSpanNamePrefix = "Elasticsearch"
+)
+// Instrumentor instruments the Elasticsearch client for OpenTelemetry tracing.
+type Instrumentor struct {
+config *Config
+}
+// NewInstrumentor creates a new Instrumentor with optional configuration.
+func NewInstrumentor(config *Config) *Instrumentor {
+if config == nil {
+config = &Config{}
+}
+if config.SpanNamePrefix == "" {
+config.SpanNamePrefix = defaultSpanNamePrefix
+}
+return &Instrumentor{config: config}
+}
+// Instrument wraps the Elasticsearch client transport with tracing.
+func (i *Instrumentor) Instrument(client *elasticsearch.Client) *elasticsearch.Client {
+transport := client.Transport
+client.Transport = &tracingTransport{
+Transport:       transport,
+tracer:          otel.Tracer("elasticsearch-instrumentation"),
+spanNamePrefix:  i.config.SpanNamePrefix,
+requestHook:     i.config.RequestHook,
+responseHook:    i.config.ResponseHook,
+}
+return client
+}
+// tracingTransport is a custom transport that adds tracing to Elasticsearch HTTP requests.
+type tracingTransport struct {
+Transport      http.RoundTripper
+tracer         trace.Tracer
+spanNamePrefix string
+requestHook    func(ctx context.Context, span trace.Span, method, url string, body interface{})
+responseHook   func(ctx context.Context, span trace.Span, response interface{})
+}
+// RoundTrip executes a single HTTP transaction and adds tracing.
+func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+ctx, span := t.tracer.Start(req.Context(), t.getOperationName(req), trace.WithSpanKind(trace.SpanKindClient))
+defer span.End()
+// Add span attributes for request details
+t.addRequestAttributes(span, req)
+// Call request hook, if provided
+if t.requestHook != nil {
+t.requestHook(ctx, span, req.Method, req.URL.String(), req.Body)
+}
+// Perform the HTTP request
+resp, err := t.Transport.RoundTrip(req)
+if err != nil {
+span.RecordError(err)
+return nil, err
+}
+// Add span attributes for response details
+t.addResponseAttributes(span, resp)
+// Call response hook, if provided
+if t.responseHook != nil {
+t.responseHook(ctx, span, resp)
+}
+return resp, nil
+}
+// getOperationName generates a span name based on the request URL.
+func (t *tracingTransport) getOperationName(req *http.Request) string {
+// Extract document ID from URL using regex
+regexDocURL := regexp.MustCompile(`/_doc/([^/]+)`)
+matches := regexDocURL.FindStringSubmatch(req.URL.Path)
+if len(matches) > 1 {
+return t.spanNamePrefix + req.URL.Path[:strings.Index(req.URL.Path, "/_doc/")] + "/_doc/:id"
+}
+return t.spanNamePrefix + req.URL.Path
+}
+// addRequestAttributes sets attributes related to the request on the span.
+func (t *tracingTransport) addRequestAttributes(span trace.Span, req *http.Request) {
+span.SetAttributes(
+trace.StringAttribute("http.method", req.Method),
+trace.StringAttribute("http.url", req.URL.String()),
+trace.StringAttribute("http.headers", formatHeaders(req.Header)),
+)
+}
+// addResponseAttributes sets attributes related to the response on the span.
+func (t *tracingTransport) addResponseAttributes(span trace.Span, resp *http.Response) {
+span.SetAttributes(
+trace.IntAttribute("http.status_code", resp.StatusCode),
+trace.StringAttribute("http.status_text", resp.Status),
+)
+}
+// Helper function to format HTTP headers as a string.
+func formatHeaders(headers http.Header) string {
+var result []string
+for key, values := range headers {
+result = append(result, key+": "+strings.Join(values, ","))
+}
+return strings.Join(result, "; ")
+}
